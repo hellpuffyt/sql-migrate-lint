@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sql-migrate-lint"
+version = "0.1.0"
+description = "Lint SQL migrations for operations that lock tables, rewrite data, or are irreversible on a live database."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Prabesh Sharma" }]
+requires-python = ">=3.10"
+keywords = ["sql", "migrations", "postgresql", "mysql", "linter", "database", "devops"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "sqlparse>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "build>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/hellpuffyt/sql-migrate-lint"
+Issues = "https://github.com/hellpuffyt/sql-migrate-lint/issues"
+
+[project.scripts]
+sql-migrate-lint = "sql_migrate_lint.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sql_migrate_lint"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = "sqlparse.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
