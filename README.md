@@ -47,20 +47,31 @@ ever reaches production.
 
 | Rule | Severity | Dialect | What it catches | Lock taken / what it blocks | Safe rewrite |
 |---|---|---|---|---|---|
-| `PG001` add-column-not-null-default | warning/error | postgres | `ADD COLUMN ... NOT NULL DEFAULT` | ACCESS EXCLUSIVE for a full table rewrite (pre-11 only; metadata-only from 11) | Add nullable column, backfill in batches, then `SET NOT NULL` + separate default |
+| `PG001` add-column-not-null-default | warning/error | postgres | `ADD COLUMN ... NOT NULL DEFAULT` (pre-11); on every version, `ADD COLUMN` with a volatile default (`random()`, `gen_random_uuid()`, `clock_timestamp()`, `nextval()`, …), `serial`, identity or `STORED` generated column | ACCESS EXCLUSIVE for a full table rewrite (constant/stable defaults are metadata-only from 11) | Add nullable column, backfill in batches, then `SET NOT NULL` + separate default |
 | `PG002` create-index-concurrently | error | postgres | `CREATE INDEX` without `CONCURRENTLY` | SHARE lock blocking writes for the build | `CREATE INDEX CONCURRENTLY` |
 | `PG003` drop-index-concurrently | warning | postgres | `DROP INDEX` without `CONCURRENTLY` | ACCESS EXCLUSIVE, brief | `DROP INDEX CONCURRENTLY` |
-| `PG004` alter-column-type | error | postgres | `ALTER COLUMN ... TYPE` (except `-> TEXT`) | ACCESS EXCLUSIVE for a full rewrite | Add column, backfill, swap; or accept if a documented no-op (e.g. widening `VARCHAR`) |
-| `PG005` add-constraint-not-valid | error | postgres | `ADD CONSTRAINT ... FOREIGN KEY/CHECK` without `NOT VALID` | Full-table scan under lock | Add `NOT VALID`, then `VALIDATE CONSTRAINT` separately |
+| `PG004` alter-column-type | error (warning for `-> TEXT` without `USING`) | postgres | `ALTER COLUMN ... TYPE` | ACCESS EXCLUSIVE for a full rewrite | Add column, backfill, swap; or accept if a documented no-op (`VARCHAR` → `TEXT`, widening `VARCHAR`) |
+| `PG005` add-constraint-not-valid | error | postgres | `ADD [CONSTRAINT name] FOREIGN KEY/CHECK` without `NOT VALID` | Full-table scan under SHARE ROW EXCLUSIVE (FK) / ACCESS EXCLUSIVE (CHECK) | Add `NOT VALID`, then `VALIDATE CONSTRAINT` separately |
 | `PG006` set-not-null | warning | postgres | `ALTER COLUMN ... SET NOT NULL` | ACCESS EXCLUSIVE for a full scan | Validated `CHECK (col IS NOT NULL)` first (PG 12+ skips the scan) |
 | `PG007` rename-hazard | warning | postgres | `RENAME TO` / `RENAME COLUMN` | Brief ACCESS EXCLUSIVE, but breaks in-flight app code | Expand/contract deploy across two releases |
 | `PG008` vacuum-cluster-reindex | error | postgres | `VACUUM FULL`, `CLUSTER`, `REINDEX` without `CONCURRENTLY` | ACCESS EXCLUSIVE for the whole rewrite | `pg_repack`, or `REINDEX CONCURRENTLY` (12+) |
-| `PG009` missing-lock-timeout | warning | postgres | Strong-lock migration with no `lock_timeout`/`statement_timeout` | N/A — absence of a guard | Set `lock_timeout`/`statement_timeout` at the top of the migration |
+| `PG009` missing-lock-timeout | warning | postgres | Strong-lock migration with no `lock_timeout`/`statement_timeout` set *before* the first strong-lock statement | N/A — absence of a guard | Set `lock_timeout`/`statement_timeout` at the top of the migration |
 | `MY001` alter-table-copy-behavior | warning | mysql | `ALTER TABLE` without `ALGORITHM=` | COPY algorithm locks the table for the whole rebuild | `ALGORITHM=INPLACE, LOCK=NONE`, or `ALGORITHM=INSTANT` (8.0.12+) |
 | `MY002` implicit-commit | warning | mysql | DDL mixed with `START TRANSACTION`/`BEGIN` | N/A — DDL implicitly commits in MySQL | Keep DDL and atomic DML in separate migrations |
-| `GEN001` drop-irreversible | warning | both | `DROP TABLE` / `DROP COLUMN` | Brief, but data loss is permanent | Verified backup first; consider a rename-then-drop-later pattern |
+| `GEN001` drop-irreversible | warning | both | `DROP TABLE` / `DROP [COLUMN]` | Brief, but data loss is permanent | Verified backup first; consider a rename-then-drop-later pattern |
 | `GEN002` truncate | warning | both | `TRUNCATE` | Table lock, permanent data loss | Confirm intent and backup; use scoped `DELETE` if partial |
-| `GEN003` update-delete-no-where | error | both | `UPDATE`/`DELETE` with no `WHERE` | Locks proportional to the full table | Add a `WHERE` clause, or use `TRUNCATE` deliberately |
+| `GEN003` update-delete-no-where | error | both | `UPDATE`/`DELETE` with no top-level `WHERE` (a `WHERE` inside a subquery does not count) | Locks proportional to the full table | Add a `WHERE` clause, or use `TRUNCATE` deliberately |
+
+Table context: lock/rewrite rules (`PG001`, `PG002`, `PG004`–`PG006`,
+`MY001`) do not fire for a table created earlier in the same file (it is
+still empty), and `PG009` ignores such statements. Tables passed with
+`--small-table` have those findings downgraded to `info` (hidden at the
+default `--severity warning`); the irreversibility rules (`GEN00x`) are
+never softened.
+
+The PostgreSQL facts behind `PG001`, `PG002`, `PG004`, `PG005` and `PG006`
+(which statements rewrite the table, which lock mode is taken) are checked
+against a real server by `tests/test_pg_ground_truth.py` — see Testing.
 
 ## Dialects
 
@@ -95,11 +106,8 @@ line number.
 
 ## Installation
 
-```bash
-pip install sql-migrate-lint
-```
-
-Or from source:
+`sql-migrate-lint` is **not published on PyPI** (a `pip install
+sql-migrate-lint` will not find it). Install from source:
 
 ```bash
 git clone https://github.com/hellpuffyt/sql-migrate-lint.git
@@ -116,12 +124,14 @@ sql-migrate-lint migrations/0007_add_email.sql \
 sql-migrate-lint migrations/ --dialect mysql
 sql-migrate-lint migrations/ --format json
 sql-migrate-lint migrations/ --format sarif --output results.sarif
-sql-migrate-lint migrations/ --severity error        # only fail on error/critical
+sql-migrate-lint migrations/ --severity error        # only report and fail on error/critical
+sql-migrate-lint migrations/ --small-table countries  # downgrade lock findings on a known-small table
 sql-migrate-lint migrations/ --ignore PG007,GEN001    # skip specific rules
 ```
 
-Exit code is `0` if no finding meets or exceeds `--severity` (default:
-`warning`), `1` if one does, and `2` on a usage error or unparsable file.
+Findings below `--severity` (default: `warning`) are not reported. Exit
+code is `0` if no finding meets or exceeds `--severity`, `1` if one does,
+and `2` on a usage error or an unreadable / non-UTF-8 file.
 
 ## Examples
 
@@ -139,16 +149,36 @@ The dangerous set exits non-zero; the safe set exits zero.
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest            # portable suite; the PostgreSQL ground-truth tests are reported as skipped
 ruff check .
 mypy
 ```
 
+`tests/corpus/` holds representative safe and dangerous migrations with the
+exact findings each must produce.
+
+`tests/test_pg_ground_truth.py` re-checks the PostgreSQL facts against a
+real server. It creates a throwaway cluster in a temporary directory
+(Unix socket only, removed afterwards) from the binaries you point it at:
+
+```bash
+SQL_MIGRATE_LINT_PG_BINDIR=/path/to/postgresql/bin pytest -rs tests/test_pg_ground_truth.py
+```
+
+With the variable set and the binaries missing, the tests fail rather than
+skip. Last run here: PostgreSQL 17.11, 19 passed.
+
 ## Limitations
 
 - This is a static linter: it reasons from the SQL text, not from your
-  actual schema or row counts. `--rows-threshold`/`--small-table` let you
-  document known-small tables, but the tool cannot verify table size itself.
+  actual schema or row counts. `--small-table` lets you declare known-small
+  tables (and `--rows-threshold` the bound you are relying on, which is
+  only quoted in the message); the tool cannot verify table size itself.
+- Volatile defaults are recognised only for well-known built-in functions;
+  a user-defined volatile function in a `DEFAULT` is not detected.
+- Table identity across statements ignores schema qualification, so
+  `CREATE TABLE a.t` followed by `CREATE INDEX ... ON b.t` is treated as the
+  same (new) table.
 - `ALTER COLUMN ... TYPE` safety depends on the *previous* column type,
   which isn't present in an `ALTER TABLE` statement; only the `-> TEXT`
   case is treated as a guaranteed no-op. Widening `VARCHAR(n)` is flagged
@@ -164,8 +194,11 @@ mypy
 ## Security
 
 `sql-migrate-lint` only reads the files you point it at; it does not connect
-to a database, execute SQL, or send data anywhere. Report security issues by
-opening a GitHub issue.
+to a database, execute SQL, or send data anywhere (the opt-in ground-truth
+test starts its own throwaway local cluster; the linter itself never does).
+Report security issues privately via
+[GitHub security advisories](https://github.com/hellpuffyt/sql-migrate-lint/security/advisories/new);
+see [SECURITY.md](SECURITY.md).
 
 ## License
 

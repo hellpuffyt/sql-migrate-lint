@@ -87,15 +87,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Row count under which lock-related advice is softened for tables "
-            "listed in --small-table."
+            "Row count the --small-table tables are declared to stay under; "
+            "only quoted in the softened finding's message (the linter cannot "
+            "check row counts)."
         ),
     )
     parser.add_argument(
         "--small-table",
         action="append",
         default=[],
-        help="Table name known to be small (used with --rows-threshold); repeatable.",
+        help=(
+            "Table known to be small; lock/rewrite findings on it are downgraded "
+            "to info (repeatable)."
+        ),
     )
     parser.add_argument(
         "--format",
@@ -150,6 +154,13 @@ def run(argv: list[str] | None = None) -> int:
             print(f"sql-migrate-lint: could not read {file}: {exc}", file=sys.stderr)
             had_parse_error = True
             continue
+        except UnicodeDecodeError as exc:
+            print(
+                f"sql-migrate-lint: {file}: not valid UTF-8 (byte offset {exc.start})",
+                file=sys.stderr,
+            )
+            had_parse_error = True
+            continue
         try:
             findings = lint_sql(sql, str(file), options)
         except SqlParseError as exc:
@@ -158,6 +169,8 @@ def run(argv: list[str] | None = None) -> int:
             continue
         all_findings.extend(findings)
 
+    # --severity is the minimum severity both to report and to fail on.
+    all_findings = [f for f in all_findings if f.severity >= threshold]
     all_findings.sort(key=lambda f: (f.file, f.line, f.rule_id))
 
     renderer = RENDERERS[args.format]

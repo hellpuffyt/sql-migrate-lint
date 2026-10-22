@@ -16,6 +16,9 @@ from sql_migrate_lint.rules.base import (
     RE_VACUUM_FULL,
     Rule,
     make_finding,
+    small_table_keys,
+    tables_created_before,
+    target_table,
 )
 
 _NON_COLUMN_ADD_KEYWORDS = r"CONSTRAINT|PRIMARY|UNIQUE|FOREIGN|CHECK|EXCLUDE"
@@ -26,8 +29,22 @@ RE_NOT_NULL = re.compile(r"\bNOT\s+NULL\b", re.I)
 RE_DEFAULT = re.compile(r"\bDEFAULT\b", re.I)
 RE_ALTER_COLUMN_TYPE = re.compile(r"\bALTER\s+COLUMN\s+\S+\s+(?:SET\s+DATA\s+)?TYPE\s+(\S+)", re.I)
 RE_TYPE_IS_TEXT = re.compile(r"^TEXT\b", re.I)
+RE_USING = re.compile(r"\bUSING\b", re.I)
 RE_ADD_CONSTRAINT_FK_CHECK = re.compile(
-    r"\bADD\s+CONSTRAINT\s+\S+\s+(FOREIGN\s+KEY|CHECK)\b", re.I
+    r"\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(FOREIGN\s+KEY|CHECK)\b", re.I
+)
+# Column definitions whose value must be computed per existing row, which
+# forces a full table rewrite on every Postgres version (verified against
+# PostgreSQL 17: volatile defaults, serial, identity and stored generated
+# columns all change the table's relfilenode). Only well-known volatile
+# built-ins are recognised; a user-defined volatile function is not.
+RE_VOLATILE_ADD_COLUMN = re.compile(
+    r"\bDEFAULT\s+\(?\s*(?:RANDOM|GEN_RANDOM_UUID|UUID_GENERATE_V1|UUID_GENERATE_V1MC|"
+    r"UUID_GENERATE_V4|UUIDV4|UUIDV7|CLOCK_TIMESTAMP|TIMEOFDAY|NEXTVAL|TXID_CURRENT)\s*\("
+    r"|\b(?:SMALL|BIG)?SERIAL[248]?\b"
+    r"|\bGENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY\b"
+    r"|\bGENERATED\s+ALWAYS\s+AS\s*\(.*\)\s*STORED\b",
+    re.I,
 )
 RE_NOT_VALID = re.compile(r"\bNOT\s+VALID\b", re.I)
 RE_SET_NOT_NULL = re.compile(r"\bALTER\s+COLUMN\s+\S+\s+SET\s+NOT\s+NULL\b", re.I)
@@ -54,6 +71,33 @@ def _add_column_not_null_default(
         if not RE_ALTER_TABLE.match(text):
             continue
         if not RE_ADD_COLUMN.search(text):
+            continue
+        if RE_VOLATILE_ADD_COLUMN.search(text):
+            findings.append(
+                make_finding(
+                    RULE_ADD_COLUMN_NOT_NULL_DEFAULT,
+                    stmt,
+                    filename,
+                    message=(
+                        "ADD COLUMN with a volatile default (e.g. random(), "
+                        "gen_random_uuid(), clock_timestamp(), nextval()), a serial or "
+                        "identity column, or a STORED generated column rewrites the "
+                        "entire table on every Postgres version, including 11+."
+                    ),
+                    lock_info=(
+                        "ACCESS EXCLUSIVE lock for the duration of the table rewrite; "
+                        "blocks all reads and writes on the table."
+                    ),
+                    dialect=Dialect.POSTGRES,
+                    version_range="all supported versions",
+                    safe_rewrite=(
+                        "Add the column nullable with no default (or a constant "
+                        "default), backfill existing rows in batches, then set the "
+                        "volatile default for new rows and add NOT NULL separately."
+                    ),
+                    severity=Severity.ERROR,
+                )
+            )
             continue
         if not (RE_NOT_NULL.search(text) and RE_DEFAULT.search(text)):
             continue
@@ -168,8 +212,36 @@ def _alter_column_type(
         if not match:
             continue
         new_type = match.group(1)
-        if RE_TYPE_IS_TEXT.match(new_type):
-            continue  # varchar/char -> text is a documented no-op in Postgres
+        if RE_TYPE_IS_TEXT.match(new_type) and not RE_USING.search(text):
+            # VARCHAR -> TEXT is metadata-only, but CHAR(n) -> TEXT and any
+            # non-string type -> TEXT rewrite the table (verified on
+            # PostgreSQL 17). The old type is not in the statement, so this
+            # is a warning rather than an error or a silent pass.
+            findings.append(
+                make_finding(
+                    RULE_ALTER_COLUMN_TYPE,
+                    stmt,
+                    filename,
+                    message=(
+                        "ALTER COLUMN ... TYPE TEXT is metadata-only only when the old "
+                        "type is VARCHAR (or TEXT); from CHAR(n) or any non-string type "
+                        "it rewrites the table. The old type is not visible here."
+                    ),
+                    lock_info=(
+                        "ACCESS EXCLUSIVE lock; brief if metadata-only, otherwise held "
+                        "for the whole rewrite."
+                    ),
+                    dialect=Dialect.POSTGRES,
+                    version_range="all supported versions",
+                    safe_rewrite=(
+                        "If the column is VARCHAR this is safe; ignore with "
+                        "--ignore PG004. Otherwise add a TEXT column, backfill in "
+                        "batches and swap."
+                    ),
+                    severity=Severity.WARNING,
+                )
+            )
+            continue
         findings.append(
             make_finding(
                 RULE_ALTER_COLUMN_TYPE,
@@ -220,9 +292,9 @@ def _add_constraint_no_not_valid(
                     "locks the full table to validate existing rows."
                 ),
                 lock_info=(
-                    "SHARE ROW EXCLUSIVE lock (FK) or ACCESS EXCLUSIVE briefly (CHECK) "
-                    "while every existing row is scanned; blocks writes for the scan's "
-                    "duration."
+                    "FOREIGN KEY: SHARE ROW EXCLUSIVE on both tables (blocks writes); "
+                    "CHECK: ACCESS EXCLUSIVE (blocks reads and writes). Either lock is "
+                    "held while every existing row is scanned."
                 ),
                 dialect=Dialect.POSTGRES,
                 version_range="all supported versions",
@@ -371,7 +443,12 @@ def _missing_lock_timeout(
 ) -> list[Finding]:
     has_strong_lock = False
     first_strong: Statement | None = None
+    created = tables_created_before(statements)
+    small = small_table_keys(options)
     for stmt in statements:
+        table = target_table(stmt.normalized)
+        if table is not None and (table in created[stmt.index] or table in small):
+            continue  # a brand-new or declared-small table: no long lock wait
         for rule in _STRONG_LOCK_CHECKERS:
             if rule.check([stmt], options, filename):
                 has_strong_lock = True
@@ -384,7 +461,10 @@ def _missing_lock_timeout(
     if not has_strong_lock or first_strong is None:
         return []
 
-    has_timeout = any(RE_SET_TIMEOUT.match(s.normalized) for s in statements)
+    # The guard only helps if it is set *before* the first strong lock.
+    has_timeout = any(
+        RE_SET_TIMEOUT.match(s.normalized) for s in statements if s.index < first_strong.index
+    )
     if has_timeout:
         return []
 
