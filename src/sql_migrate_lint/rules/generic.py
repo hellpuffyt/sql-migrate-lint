@@ -15,7 +15,26 @@ from sql_migrate_lint.rules.base import (
     make_finding,
 )
 
-RE_DROP_COLUMN = re.compile(r"\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?\S+", re.I)
+# `DROP [COLUMN]` as an ALTER TABLE action (first action or after a comma).
+# The COLUMN keyword is optional in both Postgres and MySQL, so a bare
+# `DROP name` is a column drop unless it names another kind of object.
+RE_DROP_COLUMN = re.compile(
+    r"(?:^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\S+\s+|,\s*)"
+    r"DROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?"
+    r"(?!(?:CONSTRAINT|INDEX|KEY|PRIMARY|FOREIGN|CHECK|PARTITION|DEFAULT|NOT|"
+    r"IDENTITY|EXPRESSION|SYSTEM|PERIOD)\b)\S+",
+    re.I,
+)
+RE_PARENTHESISED = re.compile(r"\([^()]*\)")
+
+
+def _top_level(text: str) -> str:
+    """Remove parenthesised groups (subqueries, function args) so only the
+    statement's own clauses remain."""
+    previous = None
+    while previous != text:
+        previous, text = text, RE_PARENTHESISED.sub(" ", text)
+    return text
 RE_ALTER_TABLE_START = re.compile(r"^ALTER\s+TABLE\b", re.I)
 
 
@@ -95,7 +114,9 @@ def _update_delete_no_where(
         is_delete = RE_DELETE.match(text) is not None
         if not (is_update or is_delete):
             continue
-        if RE_WHERE.search(text):
+        # Only a top-level WHERE scopes the statement; a WHERE inside a
+        # subquery (`SET x = (SELECT ... WHERE ...)`) does not.
+        if RE_WHERE.search(_top_level(text)):
             continue
         verb = "UPDATE" if is_update else "DELETE"
         findings.append(

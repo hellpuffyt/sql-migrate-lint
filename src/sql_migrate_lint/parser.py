@@ -53,6 +53,13 @@ def _normalize(stmt: SqlparseStatement) -> str:
         if _is_comment_token(tok):
             pieces.append(" ")
             continue
+        if ttype in T.Literal.String.Symbol:
+            # A double-quoted identifier: keep its identity (so two different
+            # tables stay distinguishable) without exposing its text to the
+            # keyword regexes, by hex-encoding the name.
+            inner = tok.value[1:-1] if len(tok.value) >= 2 else tok.value
+            pieces.append('"Q' + inner.encode("utf-8").hex() + '"')
+            continue
         if ttype in T.Literal.String or str(ttype).startswith("Token.Literal.String"):
             value = tok.value
             masked = (

@@ -94,9 +94,16 @@ def test_pg004_flags_alter_column_type() -> None:
     assert "PG004" in rule_ids(findings)
 
 
-def test_pg004_clean_when_converting_to_text() -> None:
-    findings = lint("ALTER TABLE users ALTER COLUMN bio TYPE text;")
-    assert "PG004" not in rule_ids(findings)
+def test_pg004_converting_to_text_is_only_a_warning() -> None:
+    # Expected value changed during the audit (was: no PG004 finding at all).
+    # Justification: on PostgreSQL 17, VARCHAR -> TEXT is metadata-only but
+    # CHAR(n) -> TEXT and INT -> TEXT rewrite the table (relfilenode changes),
+    # and the old type is not visible in the statement. Staying silent was a
+    # false negative; an error would be a false positive for VARCHAR.
+    sql = "ALTER TABLE users ALTER COLUMN bio TYPE text;"
+    findings = [f for f in lint(sql) if f.rule_id == "PG004"]
+    assert len(findings) == 1
+    assert str(findings[0].severity) == "warning"
 
 
 def test_pg004_flags_varchar_length_change() -> None:
