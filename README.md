@@ -3,6 +3,53 @@
 Lint SQL migrations for operations that lock tables, rewrite data, or are
 irreversible on a live database.
 
+**Status:** version 0.1.0, installed from a clone (not on PyPI). The lock and
+rewrite facts behind five PostgreSQL rules are checked against a real server
+(PostgreSQL 17 and 18 here); the MySQL rules are not checked against a server.
+
+## Demo
+
+<img src="docs/screenshots/lint-example-migrations.png" width="100%" alt="Terminal capture: sql-migrate-lint on examples/migrations/dangerous with --severity error reports PG002 (CREATE INDEX without CONCURRENTLY), PG005 (foreign key without NOT VALID) and GEN003 (UPDATE without WHERE), each with the statement, lock taken, dialect and fix, and exits 1; the safe examples report no issues and exit 0.">
+
+Real terminal capture from a clone, linting the bundled examples:
+
+```console
+$ cat examples/migrations/dangerous/0002_index_blocking.sql
+-- Blocks writes on `users` for the duration of the index build.
+CREATE INDEX idx_users_email ON users (email);
+$ sql-migrate-lint examples/migrations/dangerous/ --severity error
+examples/migrations/dangerous/0002_index_blocking.sql:2: [ERROR] PG002 CREATE INDEX without CONCURRENTLY blocks writes on the table.
+  statement: CREATE INDEX idx_users_email ON users (email);
+  lock:      SHARE lock, which blocks INSERT/UPDATE/DELETE for the duration of the index build.
+  dialect:   postgres  (version range: all supported versions)
+  fix:       Use `CREATE INDEX CONCURRENTLY` (must run outside an explicit transaction block; cannot be combined with other DDL in the same statement).
+
+examples/migrations/dangerous/0003_foreign_key_full_scan.sql:2: [ERROR] PG005 ADD CONSTRAINT (FOREIGN KEY/CHECK) without NOT VALID scans and locks the full table to validate existing rows.
+  statement: ALTER TABLE orders
+  ADD CONSTRAINT fk_orders_user
+  FOREIGN KEY (user_id) REFERENCES users (id);
+  lock:      FOREIGN KEY: SHARE ROW EXCLUSIVE on both tables (blocks writes); CHECK: ACCESS EXCLUSIVE (blocks reads and writes). Either lock is held while every existing row is scanned.
+  dialect:   postgres  (version range: all supported versions)
+  fix:       Add the constraint with NOT VALID first (fast, only takes a brief lock), then run `ALTER TABLE ... VALIDATE CONSTRAINT ...` separately, which only needs a SHARE UPDATE EXCLUSIVE lock and does not block writes.
+
+examples/migrations/dangerous/0004_drop_and_truncate.sql:6: [ERROR] GEN003 UPDATE without a WHERE clause affects every row in the table and cannot be undone without a backup.
+  statement: UPDATE users SET last_login = NULL;
+  lock:      Row/table locks proportional to the full table for the duration of the statement.
+  dialect:   postgres, mysql  (version range: all supported versions)
+  fix:       Add a WHERE clause scoping the update to the intended rows, or if the intent really is every row, use TRUNCATE (for DELETE) and document it as an explicit, backed-up decision.
+
+3 issue(s) found (3 error).
+$ echo $?
+1
+$ sql-migrate-lint examples/migrations/safe/
+No issues found.
+$ echo $?
+0
+```
+
+Without `--severity error`, the dangerous set also reports the
+warning-level findings (`PG001`, `PG009`, `GEN001`, `GEN002`): 9 in total.
+
 ## What
 
 `sql-migrate-lint` reads your `.sql` migration files and flags statements
@@ -19,8 +66,8 @@ down, because staging has a thousand rows and production has forty million.
 `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT` rewrites the whole table
 under an exclusive lock on PostgreSQL before version 11. `CREATE INDEX`
 without `CONCURRENTLY` blocks writes for the duration of the build. Nothing
-in the SQL text says so — the danger is in what the database engine does
-with the statement, not in the statement's syntax. This tool encodes that
+in the SQL text says so: the danger is in what the database engine does
+with the statement, not in its syntax. This tool encodes that
 engine-level knowledge so it surfaces in code review, before the migration
 ever reaches production.
 
@@ -40,8 +87,9 @@ ever reaches production.
   trigger false positives.
 - Human text, JSON, and SARIF output, for terminals, scripts, and GitHub
   code scanning.
-- Works on individual files or whole migration directories (numbered
-  migration layouts like Flyway/Sqitch-style `NNN_description.sql`).
+- Works on individual files or whole directories: every `.sql` file below a
+  directory is found recursively and linted in path order, which suits
+  numbered layouts such as Flyway's or plain `NNN_description.sql`.
 
 ## Rules reference
 
@@ -55,9 +103,9 @@ ever reaches production.
 | `PG006` set-not-null | warning | postgres | `ALTER COLUMN ... SET NOT NULL` | ACCESS EXCLUSIVE for a full scan | Validated `CHECK (col IS NOT NULL)` first (PG 12+ skips the scan) |
 | `PG007` rename-hazard | warning | postgres | `RENAME TO` / `RENAME COLUMN` | Brief ACCESS EXCLUSIVE, but breaks in-flight app code | Expand/contract deploy across two releases |
 | `PG008` vacuum-cluster-reindex | error | postgres | `VACUUM FULL`, `CLUSTER`, `REINDEX` without `CONCURRENTLY` | ACCESS EXCLUSIVE for the whole rewrite | `pg_repack`, or `REINDEX CONCURRENTLY` (12+) |
-| `PG009` missing-lock-timeout | warning | postgres | Strong-lock migration with no `lock_timeout`/`statement_timeout` set *before* the first strong-lock statement | N/A — absence of a guard | Set `lock_timeout`/`statement_timeout` at the top of the migration |
+| `PG009` missing-lock-timeout | warning | postgres | Strong-lock migration with no `lock_timeout`/`statement_timeout` set *before* the first strong-lock statement | N/A (absence of a guard) | Set `lock_timeout`/`statement_timeout` at the top of the migration |
 | `MY001` alter-table-copy-behavior | warning | mysql | `ALTER TABLE` without `ALGORITHM=` | COPY algorithm locks the table for the whole rebuild | `ALGORITHM=INPLACE, LOCK=NONE`, or `ALGORITHM=INSTANT` (8.0.12+) |
-| `MY002` implicit-commit | warning | mysql | DDL mixed with `START TRANSACTION`/`BEGIN` | N/A — DDL implicitly commits in MySQL | Keep DDL and atomic DML in separate migrations |
+| `MY002` implicit-commit | warning | mysql | DDL mixed with `START TRANSACTION`/`BEGIN` | N/A (DDL implicitly commits in MySQL) | Keep DDL and atomic DML in separate migrations |
 | `GEN001` drop-irreversible | warning | both | `DROP TABLE` / `DROP [COLUMN]` | Brief, but data loss is permanent | Verified backup first; consider a rename-then-drop-later pattern |
 | `GEN002` truncate | warning | both | `TRUNCATE` | Table lock, permanent data loss | Confirm intent and backup; use scoped `DELETE` if partial |
 | `GEN003` update-delete-no-where | error | both | `UPDATE`/`DELETE` with no top-level `WHERE` (a `WHERE` inside a subquery does not count) | Locks proportional to the full table | Add a `WHERE` clause, or use `TRUNCATE` deliberately |
@@ -71,7 +119,7 @@ never softened.
 
 The PostgreSQL facts behind `PG001`, `PG002`, `PG004`, `PG005` and `PG006`
 (which statements rewrite the table, which lock mode is taken) are checked
-against a real server by `tests/test_pg_ground_truth.py` — see Testing.
+against a real server by `tests/test_pg_ground_truth.py` (see Testing).
 
 ## Dialects
 
@@ -107,11 +155,13 @@ line number.
 ## Installation
 
 `sql-migrate-lint` is **not published on PyPI** (a `pip install
-sql-migrate-lint` will not find it). Install from source:
+sql-migrate-lint` will not find it). It needs Python 3.10 or newer; the only
+runtime dependency is `sqlparse`. Install from source:
 
 ```bash
 git clone https://github.com/hellpuffyt/sql-migrate-lint.git
 cd sql-migrate-lint
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
@@ -120,7 +170,7 @@ pip install -e ".[dev]"
 ```bash
 sql-migrate-lint migrations/                       # lint a directory, postgres, warning+
 sql-migrate-lint migrations/0007_add_email.sql \
-  --dialect postgres --target-version 11+           # PG001 will not fire below
+  --dialect postgres --target-version 11+           # PG001 skips constant defaults on 11+
 sql-migrate-lint migrations/ --dialect mysql
 sql-migrate-lint migrations/ --format json
 sql-migrate-lint migrations/ --format sarif --output results.sarif
@@ -128,6 +178,10 @@ sql-migrate-lint migrations/ --severity error        # only report and fail on e
 sql-migrate-lint migrations/ --small-table countries  # downgrade lock findings on a known-small table
 sql-migrate-lint migrations/ --ignore PG007,GEN001    # skip specific rules
 ```
+
+`--small-table` is repeatable. `--rows-threshold N` records the size you
+are relying on for those tables; it only appears in the softened message.
+`--output FILE` writes any format to a file instead of stdout.
 
 Findings below `--severity` (default: `warning`) are not reported. Exit
 code is `0` if no finding meets or exceeds `--severity`, `1` if one does,
@@ -143,7 +197,8 @@ sql-migrate-lint examples/migrations/dangerous/ --dialect postgres
 sql-migrate-lint examples/migrations/safe/ --dialect postgres
 ```
 
-The dangerous set exits non-zero; the safe set exits zero.
+The dangerous set reports 9 findings (3 error, 6 warning) and exits `1`; the
+safe set reports none and exits `0`.
 
 ## Testing
 
@@ -166,7 +221,12 @@ SQL_MIGRATE_LINT_PG_BINDIR=/path/to/postgresql/bin pytest -rs tests/test_pg_grou
 ```
 
 With the variable set and the binaries missing, the tests fail rather than
-skip. Last run here: PostgreSQL 17.11, 19 passed.
+skip. Last run: 19 passed against both PostgreSQL 17.11 and 18 (Homebrew
+builds, 2026-10-26).
+
+CI runs `pytest` on Python 3.10 to 3.13 across Ubuntu, Windows and macOS,
+`ruff` and `mypy` in a separate job, a CLI smoke job on the examples, a
+wheel build, and the ground-truth tests against the runner's PostgreSQL.
 
 ## Limitations
 
@@ -199,6 +259,13 @@ test starts its own throwaway local cluster; the linter itself never does).
 Report security issues privately via
 [GitHub security advisories](https://github.com/hellpuffyt/sql-migrate-lint/security/advisories/new);
 see [SECURITY.md](SECURITY.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in
+[CHANGELOG.md](CHANGELOG.md), and
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) records the
+last audit.
 
 ## License
 
